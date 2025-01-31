@@ -9,12 +9,17 @@
 -export([main/0]).
 -export([send_message/2]).
 
+% For Test.
+-export([hibernate_while/2]).
+
 
 % 5s
 -define(DEFAULT_INIT_JOIN_TIMEOUT, 11000).
 -define(NEXT_ROUND_INTERVAL, 11000).
 -define(DEFAULT_PING_TIMEOUT, 10000).
 -define(DEFAULT_WAIT_CONFIRM_TIMEOUT, 10000).
+% Theory recommend at least 3 times.
+-define(DEFAULT_PING_REQ_TRY, 3).
 
 -record(wait_ping_ack, {
   skip_list = [] :: list(),
@@ -39,21 +44,12 @@
 -record(?MODULE, {
   my_state = init :: init | ready,
   my_self = undefined,
-  % #{pid() => #node_state{}}
-  actives = #{},
+  actives = #{} :: #{pid() => #node_state{}},
   suspects = #{} :: {wait_ping_ack, #wait_ping_ack{}} |
                     {wait_ping_req_ack, #wait_ping_req_ack{}} |
                     {wait_confirm, #wait_confirm{}},
   try_join_timer = undefined
 }).
-
--type suspect_type() ::
-  wait_ping_ack |
-  wait_ping_req_ack |
-  wait_confirm.
-
--type suspect_key() ::
-  pid().
 
 -type suspect_value() ::
   {wait_ping_ack, #wait_ping_ack{}} |
@@ -63,21 +59,80 @@
 -type actives() ::
   #{pid() => #node_state{}}.
 
--type swim_msg_type() ::
-  % ping_timeout, Suspect
-  {ping_timeout, pid()} |
+-type suspects() ::
+  #{pid() => suspect_value()}.
 
-  % alive, pid which is suspected in previous.
-  {alive, pid()} |
-  {suspected, pid(), actives()}.
+-type suspect() :: pid().
+-type from() :: pid().
+-type swim_node() :: pid().
+-type incarnation() :: integer().
+
+-type swim_msg_type() ::
+
+  {joining, list(swim_node())} |
+
+  % PID which join message from
+  {join, from()} |
+
+  % the actives are gossiped active nodes in cluster.
+  {joined, actives()} |
+
+  % PID which message from
+  {next_round, from()} |
+
+  % PID which message from
+  % the actives are gossiped active nodes in cluster.
+  {ping, from(), actives()} |
+
+  % PID which message from suspect.
+  {ping_timeout, suspect()} |
+
+  {ping_ack, from(), actives()} |
+
+  {ping_req, from(), suspect(), actives()} |
+
+  {suspected, suspect(), incarnation(), actives()} |
+
+  {wait_confirm_timeout, suspect()} |
+
+  {left, suspect(), incarnation(), actives()} |
+
+  {alive, suspect(), incarnation(), actives()}.
+
+
 
 main() ->
+  % scenario
+  % 1. 'A' suspect 'B'.
+  % 2. 'B' decline 'A' by sending Alive Message.
+  % 3. 'B' still is member of cluster.
+  process_flag(trap_exit, true),
+
   swim_node:start_link([], 'A'),
   timer:sleep(1000),
-  swim_node:start_link(['A'], 'B').
-  % There are potential concurrency problem.
-  % Because 'B'는 is not a cluster member yet.
-  % So, Process 'C' may fail to find Node 'B'.
+  swim_node:start_link(['A'], 'B'),
+  timer:sleep(1000),
+
+  swim_node:hibernate_while(30000, whereis('B')).
+
+%%main() ->
+% scenario
+% 1. The node 'B' is terminated by accidantaly.
+% 2. The node 'A' is aware of that, and it marked 'B' as dead.
+% 3. Only 'A' is member of cluster.
+%%  process_flag(trap_exit, true),
+%%
+%%  swim_node:start_link([], 'A'),
+%%  timer:sleep(1000),
+%%  swim_node:start_link(['A'], 'B')
+%%    timer:sleep(1000),
+%%  exit(whereis('B'), exit).
+
+
+% Concurrency Problem.
+% There are potential concurrency problem.
+% Because 'B' is not a cluster member yet.
+% So, Process 'C' may fail to find Node 'B'.
 %%  swim_node:start_link(['A', 'B'], 'C').
 %%  swim_node:start_link(['A', 'B'], 'C').
 
@@ -85,6 +140,12 @@ main() ->
 start_link(ClusterNodes, MyAlias) ->
   ClusterNodesWithPid = [whereis(ClusterNodeAlias) || ClusterNodeAlias <- ClusterNodes],
   gen_server:start_link(?MODULE, [ClusterNodesWithPid, MyAlias], []).
+
+hibernate_while(Time, Pid) ->
+  % only for test scenario.
+  HibernateMsg = {hibernate, Time},
+  gen_server:cast(Pid, HibernateMsg).
+
 
 init([ClusterNodes, MyAlias]) ->
   io:format("[~p] swim_node ~p try to intialized ~n", [self(), self()]),
@@ -111,15 +172,22 @@ init([ClusterNodes, MyAlias]) ->
   State = #?MODULE{my_self=self(), my_state=MyState, actives=ActiveCluster},
   {ok, State}.
 
-% 모르는 메세지
-handle_call(_, _From, _State) ->
+handle_call(_Msg, _From, _State) ->
+  % Unknown Message.
+  io:format("[~p] swim_node ~p received unknown call message from ~p, Message is ~p~n", [self(), self(), _From, _Msg]),
   {reply, _State, _State}.
 
 handle_info(_Msg, State) ->
-  io:format("[~p] swim_node [~p] receive unknown info message ~p~n", [self(), self(), _Msg]),
+  io:format("[~p] swim_node ~p received unknown info message ~p~n", [self(), self(), _Msg]),
   {noreply, State}.
 
-% 클러스터 조인 요청을 할 때
+
+handle_cast({hibernate, Time}, State) ->
+  % only for test scenario.
+  io:format("[~p] swim_node ~p received hibernate message. it will be hibernated during ~ps.~n", [self(), self(), Time]),
+  timer:sleep(Time),
+  {noreply, State};
+
 handle_cast({joining, KnownClusterNodes}, State) ->
   io:format("[~p] node ~p try to join the clusters... ~n", [self(), self()]),
   MaybeTimer =
@@ -130,6 +198,8 @@ handle_cast({joining, KnownClusterNodes}, State) ->
         JoinMsg = join_message(self()),
         send_message(JoinMsg, Node),
 
+        % If Join request fail, node should send request to other known node.c
+        % Otherwise, it cannot join the cluster forever.
         JoiningMsg = joining_message(Rest),
         {ok, Timer} = timer:send_after(?DEFAULT_INIT_JOIN_TIMEOUT, JoiningMsg),
         Timer
@@ -137,7 +207,6 @@ handle_cast({joining, KnownClusterNodes}, State) ->
   NewState = State#?MODULE{try_join_timer=MaybeTimer},
   {noreply, NewState};
 
-% 클러스터 조인 요청을 받음.
 handle_cast({join, Peer}, State) ->
   io:format("[~p] swim_node ~p receive join request from ~p ~n", [self(), self(), Peer]),
   #?MODULE{actives=Actives} = State,
@@ -155,9 +224,6 @@ handle_cast({join, Peer}, State) ->
   NewState = State#?MODULE{actives=NewActives},
   {noreply, NewState};
 
-% 클러스터 Active의 상태가 변화함. Gossip
-% 그런데 Joined 메세지를 모든 클러스터가 받지 못할 수도 있음. (네트워크 문제로)
-% 그래서 Eventually Consistency?
 handle_cast({joined, GossipedActives}, #?MODULE{try_join_timer=PreviousTimer}=State) ->
   io:format("[~p] swim_node ~p receive joined gossip~n", [self(), self()]),
   timer:cancel(PreviousTimer),
@@ -172,19 +238,12 @@ handle_cast({next_round, Pid}, #?MODULE{suspects=Suspects, actives=Actives}=Stat
   io:format("[~p] got received {next_round, ~p}~n", [self(), Pid]),
   send_next_round_msg(),
 
-  SuspectsPidList = maps:keys(Suspects),
-  ShouldRemoveList = [self(), SuspectsPidList],
-  FilteredPeerMap = lists:foldl(
-    fun(ShouldRemovePid, Acc) ->
-      case maps:is_key(ShouldRemovePid, Acc) of
-        true -> maps:remove(ShouldRemovePid, Acc);
-        false -> Acc
-      end
-    end, Actives, ShouldRemoveList),
+  PeersToReceiveMsgMap = filter_useless_nodes_from_actives(Actives),
 
   State =
-    case pick_one_randomly(FilteredPeerMap) of
-      undefined -> State0;
+    case pick_one_randomly(PeersToReceiveMsgMap) of
+      undefined ->
+        State0;
       MaybeSuspectPid ->
         io:format("[~p] ~p send ping msg to ~p~n", [self(), self(), MaybeSuspectPid]),
 
@@ -212,29 +271,31 @@ handle_cast({ping, From, GossipedActives}, #?MODULE{actives=Actives}=State0) ->
   State = merge_gossip_into_actives_(State0, GossipedActives),
   {noreply, State};
 
-% ping_req는
 handle_cast({ping_timeout, Suspect}, #?MODULE{suspects=Suspects0, actives=Actives}=State0) ->
+  io:format("[~p] node ~p received ping_timeout message. suspect is ~p~n", [self(), self(), Suspect]),
+
   State =
-    case maps:get(Suspect, Suspects0) of
+    case maps:get(Suspect, Suspects0, undefined) of
       {wait_ping_ack, WaitPingTimerRecord} ->
         #wait_ping_ack{skip_list=SkipList, timers=Timers, state=WaitPingState} = WaitPingTimerRecord,
         case {Timers, WaitPingState} of
-          % 이미 다 제거된 경우.
+          % In case of first NEXT round is failed, and in trying to ping_req.
           {_Timers, ping_req} ->
             gossip_suspect_node(State0, Suspect);
-          % 남은 Timer가 다 제거될 때까지 기다린다.
-          % Timer 정보는 어떻게 알 수 있지?
+          % In case of first NEXT round try
           {_Timers, first} ->
             OtherCandidates = maps:filter(
               fun(Pid, _) ->
                 not lists:member(Pid, SkipList)
               end, Actives),
+
             case OtherCandidates of
               [] ->
+                % There is no node to delegate ping_req at all.
                 gossip_suspect_node(State0, Suspect);
-              OtherCandidates ->
 
-                send_ping_req_message_max_n_times(3, OtherCandidates, Actives, Suspect),
+              OtherCandidates ->
+                send_ping_req_message_max_n_times(?DEFAULT_PING_REQ_TRY, OtherCandidates, Actives, Suspect),
 
                 PingTimeoutMsg = ping_timeout_message(Suspect),
                 {ok, Timer} = timer:apply_after(?DEFAULT_PING_TIMEOUT, swim_node, send_message, [PingTimeoutMsg, self()]),
@@ -246,15 +307,28 @@ handle_cast({ping_timeout, Suspect}, #?MODULE{suspects=Suspects0, actives=Active
             end
         end;
       {wait_ping_req_ack, _WaitingPingReqAck} ->
-        % delegate to determine it's suspected
+        % delegate to determine it's suspected.
+        % If node which is responsible of ping_req don't response ping_ack to requester node until timer bomb,
+        % The request node's timer will be send timeout message to request node.
+        % Then, request node will broadcast suspected message.
+        State0;
+      undefined ->
+        % erlang has concurrency scenario
+        % 1. suspect timer is reserved
+        % 2. suspect decline by sending alive msg.
+        % 3. Node started to handle alive msg.
+        % 4. However, the timer has been expired, so ping_timeout message is already reach to node's postbox.
+        % 5. Node cancel all timers successfully. however, ping_timeout message still in node's postbox.
+        % To prevent for situation above to kill the current node process, we added 'undefined' clauses.
         State0;
       _ ->
         State0
     end,
   {noreply, State};
 
-handle_cast({ping_req, Requester, Suspect, _Gossip}, #?MODULE{actives=Actives, suspects=Suspects}=State0) ->
+handle_cast({ping_req, Requester, Suspect, GossipedActives}, State0) ->
   io:format("[~p] ~p got ping_req message from ~p~n", [self(), self(), Requester]),
+  #?MODULE{actives=Actives, suspects=Suspects}=State0,
 
   PingMsg = {ping, self(), Actives},
   send_message(PingMsg, Suspect),
@@ -266,47 +340,43 @@ handle_cast({ping_req, Requester, Suspect, _Gossip}, #?MODULE{actives=Actives, s
   SuspectValue = {wait_ping_req_ack, WaitPingReqAck},
   UpdatedSuspects = maps:put(Suspect, SuspectValue, Suspects),
 
-  State = #?MODULE{suspects=UpdatedSuspects},
+  State1 = #?MODULE{suspects=UpdatedSuspects},
+  State = merge_gossip_into_actives_(State1, GossipedActives),
+
   {noreply, State};
 
-handle_cast({ping_ack, FromSuspect, _Gossip}=Msg, #?MODULE{suspects=Suspects0}=State0) ->
+handle_cast({ping_ack, FromSuspect, GossipedActives}=Msg, State0) ->
   io:format("[~p] ~p got ping_ack message from ~p~n", [self(), self(), FromSuspect]),
-  State =
+  #?MODULE{suspects=Suspects0}=State0,
+
+  State1 =
     case maps:is_key(FromSuspect, Suspects0) of
       true ->
         case maps:get(FromSuspect, Suspects0) of
           {wait_ping_req_ack, Record} ->
-            % delegate
-            % ping_req를 받은 녀석은, ACK를 받는 경우
-            % 1. 자신의 suspect list에서 지운다.
-            % 2. ping_req를 요청한 녀석에게 응답한다.
             cancel_timers(get_timers(Record)),
             #wait_ping_req_ack{requester=Requester} = Record,
             send_message(Msg, Requester);
           {wait_ping_ack, Record} ->
-            % 처음에 ping을 보낸 녀석이..
-            % 1. suspect에게 직접 받거나
-            % 2. 중재자를 통해서 받은 경우
-            % 가 존재하는데
-            % 여기서
-            % 1. suspect list에서 문제를 제거하기만 하면 된다.
             cancel_timers(get_timers(Record));
           {wait_confirm, Record} ->
-            % 지우기 거의 마지막인 녀석이 있음.
-            % 여기서 ping_ack를 받으면 살아났다고 볼 수 있다.
             cancel_timers(get_timers(Record));
+          % Unknown Message. so, it should be ignored.
           _ -> ok
         end,
-        % Suspect에서 제거한다.
         UpdateSuspects = maps:remove(FromSuspect, Suspects0),
         State0#?MODULE{suspects=UpdateSuspects};
+
       false ->
           State0
     end,
+
+  State = merge_gossip_into_actives_(State1, GossipedActives),
   {noreply, State};
 
 % Extend Point
-handle_cast({suspected, Suspect, GossipedActives}, State0) ->
+handle_cast({suspected, Suspect, GossipedIncarnation, GossipedActives}, State0) ->
+
   #?MODULE{actives=Actives0, suspects=Suspects0}=State0,
   Self = self(),
 
@@ -327,27 +397,30 @@ handle_cast({suspected, Suspect, GossipedActives}, State0) ->
         ActivePeerListExceptSelf = lists:delete(Self, maps:keys(Actives)),
         AliveMsg = alive_message(Self, NewIncarnation, Actives),
         send_messages(AliveMsg, ActivePeerListExceptSelf),
-        State0;
+
+        State1;
       false ->
         TimeoutMsg = {wait_confirm_timeout, Suspect},
-
         {ok, Timer} = send_message_after(?DEFAULT_WAIT_CONFIRM_TIMEOUT, TimeoutMsg, Self),
-        SuspectValue = {wait_confirm, Timer},
 
+        NewState0 = merge_gossip_into_actives_(Actives0, GossipedActives),
+        MaybeNewNodeStateOfSuspect =
+          apply_diff_with_considering_incarnation(Suspect, suspected, Actives0, GossipedIncarnation),
+        NewState1 = put_it_into_actives_get_state(Suspect, MaybeNewNodeStateOfSuspect, NewState0),
+
+        SuspectValue = {wait_confirm, Timer},
         UpdatedSuspects = maps:put(Suspect, SuspectValue, Suspects0),
-        State0#?MODULE{suspects=UpdatedSuspects}
+
+        NewState1#?MODULE{suspects=UpdatedSuspects}
   end,
   {noreply, State};
 
 
-handle_cast({wait_confirm_timeout, Suspect}, #?MODULE{actives=Actives0, suspects=Suspects0}=State0) ->
+handle_cast({wait_confirm_timeout, Suspect}, State0) ->
   State = leave_suspect_node(State0, Suspect),
   {noreply, State};
 
 handle_cast({alive, Suspect, GossipedIncarnation, GossipedActive}, #?MODULE{actives=Actives0, suspects=Suspects0}=State0) ->
-  % TODO
-  % 1. Suspect에 있던 것 제거
-  % 2. Timer 제거
   State =
     case maps:get(Suspect, Suspects0) of
       {wait_confirm, WaitConfirmRecord} ->
@@ -380,16 +453,19 @@ handle_cast({left, LeftNode, GossipedIncarnation, GossipedActives}, State0) ->
   Actives1 =
     case maps:is_key(LeftNode, Actives0) of
       true ->
-        #node_state{incarnation=KnownIncarnation} = maps:get(LeftNode, Actives0),
-        case KnownIncarnation < GossipedIncarnation of
-          true -> maps:put(LeftNode, #node_state{state=dead, incarnation=GossipedIncarnation}, Actives0);
-          false -> Actives0
-        end;
+        MaybeNewNodeStateOfLeftNode =
+          apply_diff_with_considering_incarnation(LeftNode, dead, Actives0, GossipedIncarnation),
+
+        StateWithNewLeftNode = put_it_into_actives_get_state(LeftNode, MaybeNewNodeStateOfLeftNode, State0),
+
+        #?MODULE{actives=MergedActives} = StateWithNewLeftNode,
+        MergedActives;
       false -> Actives0
     end,
 
+  GossipedActivesExceptLeftNode = remove_node_state(LeftNode, GossipedActives),
   State1 = State0#?MODULE{actives=Actives1},
-  State2 = merge_gossip_into_actives_(State1, GossipedActives),
+  State2 = merge_gossip_into_actives_(State1, GossipedActivesExceptLeftNode),
   State = State2#?MODULE{suspects=Suspects},
   {noreply, State};
 
@@ -438,17 +514,39 @@ send_next_round_msg() ->
   Msg = next_round_message(self()),
   send_message_after(?NEXT_ROUND_INTERVAL, Msg, self()).
 
+filter_useless_nodes_from_actives(Actives) ->
+  Filter1 =
+    fun(ShouldRemovePid, Acc) ->
+      case maps:is_key(ShouldRemovePid, Acc) of
+        true -> maps:remove(ShouldRemovePid, Acc);
+        false -> Acc
+      end
+    end,
+
+  ShouldRemoveList = [self()],
+  FilteredPeerMap1 = lists:foldl(Filter1, Actives, ShouldRemoveList),
+
+  Filter2 =
+    fun(_Key, Value) ->
+      #node_state{state=State} = Value,
+      State =:= alive
+    end,
+
+  maps:filter(Filter2, FilteredPeerMap1).
+
 gossip_suspect_node(State0, Suspect) ->
   #?MODULE{actives=Actives0, suspects=Suspects0} = State0,
 
   NodeStateOfSuspected = maps:get(Suspect, Actives0),
   #node_state{incarnation=Incarnation} = NodeStateOfSuspected,
-  NewNodeState = #node_state{incarnation=Incarnation + 1, state=suspected},
+  NewIncarnation = Incarnation + 1,
+  NewNodeState = #node_state{incarnation=NewIncarnation, state=suspected},
   Actives = maps:put(Suspect, NewNodeState, Actives0),
 
   Self = self(),
-  SuspectedMsg = suspected_message(Suspect, Actives),
-  SendToSuspectedMsgPeers = maps:remove(Self, Actives),
+  SuspectedMsg = suspected_message(Suspect, NewIncarnation, Actives),
+  SendToSuspectedMsgPeerMap = maps:remove(Self, Actives),
+  SendToSuspectedMsgPeers = maps:keys(SendToSuspectedMsgPeerMap),
   send_messages(SuspectedMsg, SendToSuspectedMsgPeers),
 
   WaitConfirmTimeoutMsg = wait_confirm_timeout_message(Suspect),
@@ -459,18 +557,19 @@ gossip_suspect_node(State0, Suspect) ->
   State0#?MODULE{suspects=Suspects, actives=Actives}.
 
 leave_suspect_node(#?MODULE{actives=Actives0, suspects=Suspects0}=State, Suspect) ->
-  #node_state{incarnation=PreviousIncarnation} = RemovingNodeState = maps:get(Suspect, Actives0),
-  NewIncarnation = PreviousIncarnation + 1,
+  Suspects = maps:remove(Suspect, Suspects0),
+
+  NewIncarnation = get_incarnation_by_pid(Actives0, Suspect) + 1,
   NewNodeState = #node_state{state=dead, incarnation=NewIncarnation},
 
   Actives = maps:put(Suspect, NewNodeState, Actives0),
-  ShouldReceiveMsgPeerList0 = maps:remove(self(), Actives),
-  ShouldReceiveMsgPeerList = maps:remove(Suspect, ShouldReceiveMsgPeerList0),
+  ShouldReceiveMsgPeerMaps0 = maps:remove(self(), Actives),
+  ShouldReceiveMsgPeerMaps1 = maps:remove(Suspect, ShouldReceiveMsgPeerMaps0),
+  PeersToReceive = maps:keys(ShouldReceiveMsgPeerMaps1),
 
   LeftMsg = left_node_message(Suspect, NewIncarnation, Actives),
-  send_messages(LeftMsg, ShouldReceiveMsgPeerList),
+  send_messages(LeftMsg, PeersToReceive),
 
-  Suspects = maps:remove(Suspect, Suspects0),
   State#?MODULE{actives=Actives, suspects=Suspects}.
 
 send_message_max_n_times_(_RemainCount, [], _Msg, _Suspect) ->
@@ -511,6 +610,25 @@ cancel_timers([Timer|Tail]) ->
   timer:cancel(Timer),
   cancel_timers(Tail).
 
+remove_node_state(NodePid, Actives) ->
+  maps:remove(NodePid, Actives).
+
+apply_diff_with_considering_incarnation(NodePid, DesiredState, PreviousActives, GossipedIncarnation) ->
+  io:format("[~p] node ~p try to merge gossiped information. ~n", [self(), self()]),
+  PreviousIncarnation = get_incarnation_by_pid(PreviousActives, NodePid),
+  case PreviousIncarnation < GossipedIncarnation of
+    true ->
+      #node_state{state=DesiredState, incarnation=GossipedIncarnation};
+    false ->
+      maps:get(NodePid, PreviousActives)
+  end.
+
+put_it_into_actives_get_state(NodePid, NodeState, State) ->
+  #?MODULE{actives=PreviousActives} = State,
+  NewActives = maps:put(NodePid, NodeState, PreviousActives),
+  State#?MODULE{actives=NewActives}.
+
+%%% SWIM Protocol Message
 joining_message(ClusterNodes) ->
   {joining, ClusterNodes}.
 
@@ -532,11 +650,11 @@ ping_message(From, Actives) ->
 ping_ack_message(From, Actives) ->
   {ping_ack, From, Actives}.
 
-ping_req_message(From, Suspect, Actives) ->
-  {ping_req, From, Suspect, Actives}.
+ping_req_message(From, Suspect, GossipedActives) ->
+  {ping_req, From, Suspect, GossipedActives}.
 
-suspected_message(Suspect, Actives) ->
-  {suspected, Suspect, Actives}.
+suspected_message(Suspect, Incarnation, Actives) ->
+  {suspected, Suspect, Incarnation, Actives}.
 
 alive_message(Suspect, Incarnation, Actives) ->
   {alive, Suspect, Incarnation, Actives}.
@@ -553,10 +671,14 @@ get_timers(#wait_ping_req_ack{timers=Timers}=_Record) ->
   Timers;
 get_timers(#wait_confirm{timers=Timers}=_Record) ->
   Timers;
-get_timers(Record) ->
+get_timers(_Record) ->
   % can't reach here.
   undefined.
 
 get_incarnation_by_pid(Actives, Pid) ->
-  #node_state{incarnation=Incarnation} = maps:get(Pid, LocalActives),
-  Incarnation.
+  % If Incarnation Number is -1, it always will be ignored.
+  % Because default values is 0.
+  case maps:get(Pid, Actives, undefined) of
+    undefined -> -1;
+    #node_state{incarnation=Incarnation} -> Incarnation
+  end.
