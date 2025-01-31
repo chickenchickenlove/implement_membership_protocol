@@ -101,6 +101,13 @@
 
 
 
+%%main() ->
+%%  % normal case
+%%  swim_node:start_link([], 'A'),
+%%  timer:sleep(1000),
+%%  swim_node:start_link(['A'], 'B'),
+%%  timer:sleep(1000).
+
 main() ->
   % scenario
   % 1. 'A' suspect 'B'.
@@ -113,7 +120,7 @@ main() ->
   swim_node:start_link(['A'], 'B'),
   timer:sleep(1000),
 
-  swim_node:hibernate_while(30000, whereis('B')).
+  swim_node:hibernate_while(35000, whereis('B')).
 
 %%main() ->
 % scenario
@@ -124,8 +131,8 @@ main() ->
 %%
 %%  swim_node:start_link([], 'A'),
 %%  timer:sleep(1000),
-%%  swim_node:start_link(['A'], 'B')
-%%    timer:sleep(1000),
+%%  swim_node:start_link(['A'], 'B'),
+%%  timer:sleep(1000),
 %%  exit(whereis('B'), exit).
 
 
@@ -226,10 +233,12 @@ handle_cast({join, Peer}, State) ->
 
 handle_cast({joined, GossipedActives}, #?MODULE{try_join_timer=PreviousTimer}=State) ->
   io:format("[~p] swim_node ~p receive joined gossip~n", [self(), self()]),
-  timer:cancel(PreviousTimer),
+
   NewState0 = merge_gossip_into_actives_(State, GossipedActives),
   NewState = case is_joining_node(NewState0) of
-               true -> process_task_and_update_after_joined(NewState0);
+               true ->
+                 timer:cancel(PreviousTimer),
+                 process_task_and_update_after_joined(NewState0);
                false -> NewState0
              end,
   {noreply, NewState};
@@ -376,6 +385,7 @@ handle_cast({ping_ack, FromSuspect, GossipedActives}=Msg, State0) ->
 
 % Extend Point
 handle_cast({suspected, Suspect, GossipedIncarnation, GossipedActives}, State0) ->
+  io:format("[~p] node ~p received suspected message. suspect is ~p.~n", [self(), self(), Suspect]),
 
   #?MODULE{actives=Actives0, suspects=Suspects0}=State0,
   Self = self(),
@@ -400,7 +410,8 @@ handle_cast({suspected, Suspect, GossipedIncarnation, GossipedActives}, State0) 
 
         State1;
       false ->
-        TimeoutMsg = {wait_confirm_timeout, Suspect},
+        LocalIncarnation = get_incarnation_by_pid(Actives0, Suspect),
+        TimeoutMsg = wait_confirm_timeout_message(Suspect, LocalIncarnation),
         {ok, Timer} = send_message_after(?DEFAULT_WAIT_CONFIRM_TIMEOUT, TimeoutMsg, Self),
 
         NewState0 = merge_gossip_into_actives_(Actives0, GossipedActives),
@@ -416,13 +427,24 @@ handle_cast({suspected, Suspect, GossipedIncarnation, GossipedActives}, State0) 
   {noreply, State};
 
 
-handle_cast({wait_confirm_timeout, Suspect}, State0) ->
-  State = leave_suspect_node(State0, Suspect),
+handle_cast({wait_confirm_timeout, Suspect, Incarnation}, State0) ->
+  io:format("[~p] node ~p received wait_confirm_timeout message. suspect is ~p~n.", [self(), self(), Suspect]),
+  #?MODULE{actives=Actives} = State0,
+  LocalIncarnation = get_incarnation_by_pid(Actives, Suspect),
+
+  State =
+    case LocalIncarnation < Incarnation of
+      true ->  leave_suspect_node(State0, Suspect);
+      false -> State0
+    end,
+
   {noreply, State};
 
-handle_cast({alive, Suspect, GossipedIncarnation, GossipedActive}, #?MODULE{actives=Actives0, suspects=Suspects0}=State0) ->
+handle_cast({alive, Suspect, GossipedIncarnation, GossipedActive}, State0) ->
+  io:format("[~p] node ~p received alive message. suspect is ~p~n.", [self(), self(), Suspect]),
+  #?MODULE{actives=Actives0, suspects=Suspects0}=State0,
   State =
-    case maps:get(Suspect, Suspects0) of
+    case maps:get(Suspect, Suspects0, undefined) of
       {wait_confirm, WaitConfirmRecord} ->
         LocalIncarnation = get_incarnation_by_pid(Actives0, Suspect),
         case LocalIncarnation < GossipedIncarnation of
@@ -432,15 +454,18 @@ handle_cast({alive, Suspect, GossipedIncarnation, GossipedActive}, #?MODULE{acti
 
             State1 = merge_gossip_into_actives_(State0, GossipedActive),
             State1#?MODULE{suspects=UpdatedSuspects};
+
           false ->
             merge_gossip_into_actives_(State0, GossipedActive)
         end;
+
       _ ->
         merge_gossip_into_actives_(State0, GossipedActive)
   end,
   {noreply, State};
 
 handle_cast({left, LeftNode, GossipedIncarnation, GossipedActives}, State0) ->
+  io:format("[~p] node ~p received left message. suspect is ~p~n.", [self(), self(), LeftNode]),
   #?MODULE{actives=Actives0, suspects=Suspects0}=State0,
   Suspects =
     case maps:get(LeftNode, Suspects0) of
@@ -549,7 +574,8 @@ gossip_suspect_node(State0, Suspect) ->
   SendToSuspectedMsgPeers = maps:keys(SendToSuspectedMsgPeerMap),
   send_messages(SuspectedMsg, SendToSuspectedMsgPeers),
 
-  WaitConfirmTimeoutMsg = wait_confirm_timeout_message(Suspect),
+  LocalIncarnations = get_incarnation_by_pid(Actives, Suspect),
+  WaitConfirmTimeoutMsg = wait_confirm_timeout_message(Suspect, LocalIncarnations),
   {ok, Timer} = send_message_after(?DEFAULT_WAIT_CONFIRM_TIMEOUT, WaitConfirmTimeoutMsg, Self),
 
   SuspectValue = {wait_confirm, Suspect, Timer},
@@ -659,8 +685,8 @@ suspected_message(Suspect, Incarnation, Actives) ->
 alive_message(Suspect, Incarnation, Actives) ->
   {alive, Suspect, Incarnation, Actives}.
 
-wait_confirm_timeout_message(Suspect) ->
-  {wait_confirm_timeout, Suspect}.
+wait_confirm_timeout_message(Suspect, Incarnation) ->
+  {wait_confirm_timeout, Suspect, Incarnation}.
 
 left_node_message(Suspect, Incarnation, Actives) ->
   {left, Suspect, Incarnation, Actives}.
