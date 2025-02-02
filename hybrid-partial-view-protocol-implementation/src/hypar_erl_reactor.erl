@@ -13,9 +13,13 @@
 
 % Reactor abstract
 send(Target, Message) ->
+  % In TCP Condition,
+  % We should send a message to Node with IP.
   gen_server:cast(Target, Message).
 
 disconnect(Endpoint) ->
+  % In TCP Condition,
+  % We should disconnect TCP socket when this function is called.
   ok.
 
 notify(PeerEvent) ->
