@@ -48,20 +48,23 @@ main() ->
   hypar_view_node:start_link('C', Config),
   timer:sleep(1000),
 
-%%  hypar_view_node:start_link('D', Config),
-%%  timer:sleep(1000),
-%%
-%%  hypar_view_node:start_link('E', Config),
-%%  timer:sleep(1000),
-%%
-%%  hypar_view_node:start_link('F', Config),
-%%  timer:sleep(1000),
+  hypar_view_node:start_link('D', Config),
+  timer:sleep(1000),
 
+  hypar_view_node:start_link('E', Config),
+  timer:sleep(1000),
+
+  % Node 'A' puts Node 'B' into its active view.
   join('A', 'B'),
-  join('B', 'C').
-%%  join('C', 'D'),
-%%  join('D', 'E'),
-%%  join('E', 'F').
+
+  % Node 'B' puts Node 'C' into its active view.
+  join('B', 'C'),
+
+  % Node 'B' puts Node 'D' into its active view.
+  join('B', 'D'),
+
+  % Node 'B' puts Node 'E' into its active view.
+  join('B', 'E').
 
 start_link(NodeName, Config) ->
   gen_server:start_link(?MODULE, [NodeName, Config], []).
@@ -84,9 +87,8 @@ init([NodeName, Config]) ->
   State = #?MODULE{name=NodeName, pid=SelfPid, config=Config},
   {ok, State}.
 
-handle_call(Msg, From, State) ->
+handle_call(_Msg, _From, State) ->
   {noreply, State}.
-
 
 handle_cast({api_join, MyName, ClusterNodeName}, State) ->
   io:format("[~p] node ~p received api join message. try to join node ~p to ~p's active view.~n", [self(), self(), ClusterNodeName, MyName]),
@@ -111,9 +113,9 @@ handle_cast({join, NewlyAddedPeerName}, State0) ->
 
 handle_cast({{forward_join, NewlyAddedPeerName, TTL}, FromPid}, State0) ->
   io:format("[~p] node ~p received forward_join message. Newly Added PeerName ~p and TTL ~p.~n", [self(), self(), NewlyAddedPeerName, TTL]),
-  #?MODULE{active_view=ActiveView0, passive_view=Reactor, config=Config} = State0,
+  #?MODULE{active_view=ActiveView0, reactor=Reactor, config=Config} = State0,
 
-  ShouldAddItToActiveRightNow = ttl =:= 0 orelse maps:size(ActiveView0) =:= 0,
+  ShouldAddItToActiveRightNow = TTL =:= 0 orelse maps:size(ActiveView0) =:= 0,
   State =
     case ShouldAddItToActiveRightNow of
       true ->
@@ -144,7 +146,6 @@ handle_cast({{forward_join, NewlyAddedPeerName, TTL}, FromPid}, State0) ->
     end,
   {noreply, State};
 
-
 handle_cast({{neighbor, HighPriority}, FromPid}, State0) ->
   io:format("[~p] node ~p received neighbor message. FromPid ~p and HighPriority ~p.~n", [self(), self(), FromPid, HighPriority]),
   State =
@@ -155,7 +156,6 @@ handle_cast({{neighbor, HighPriority}, FromPid}, State0) ->
         add_active(FromNodeName, HighPriority, State0)
     end,
   {noreply, State};
-
 
 handle_cast({{disconnect, PeerName, Alive, Response}, FromPid}, State0) ->
   io:format("[~p] node ~p received disconnect message. Disconnect PeerName ~p, Alive ~p, Response ~p FromPid ~p.~n",
@@ -183,7 +183,6 @@ handle_cast({{disconnect, PeerName, Alive, Response}, FromPid}, State0) ->
 
 handle_cast({do_shuffle}, State) ->
   io:format("[~p] node ~p received do_shuffle message. ~p try to shuffle and send shuffle message to other active.~n", [self(), self(), self()]),
-  % TODO : CHECK Shuffle Logic. Because there is no passive view added.
   #?MODULE{config=Config} = State,
   #config{shuffle_interval=ShuffleInterval} = Config,
   schedule_shuffle(ShuffleInterval),
@@ -229,7 +228,7 @@ handle_cast({{shuffle, OriginNodeName, ReceivedShuffledNodes, TTL}, FromPid}, St
   {noreply, State};
 
 
-handle_cast({{shuffle_reply, ReceivedShuffledNodes}, FromPid}, State0) ->
+handle_cast({{shuffle_reply, ReceivedShuffledNodes}, _FromPid}, State0) ->
   io:format("[~p] node ~p received shuffle reply message. It put into its passive view.~n", [self(), self()]),
   State = add_all_passive(State0, ReceivedShuffledNodes),
   {noreply, State};
@@ -246,9 +245,7 @@ remove_active(PeerName, State0, Respond) ->
 
   DoesContainPeerInActive = maps:is_key(PeerName, ActiveView0),
   case DoesContainPeerInActive of
-    false ->
-      State0;
-
+    false -> State0;
     true ->
       ActiveView1 = maps:remove(PeerName, ActiveView0),
 
@@ -333,7 +330,6 @@ take_max_n(PeerMap, Number) ->
 take_max_n_(PeerMap, Remain, Acc) when map_size(PeerMap) =:= 0 orelse Remain =:= 0->
   Acc;
 take_max_n_(PeerMap, Remain, Acc) ->
-  io:format("take_max_n_ ~p~n", [PeerMap]),
   Size = maps:size(PeerMap),
   List = maps:keys(PeerMap),
   Index = rand:uniform(Size),
@@ -366,7 +362,6 @@ add_all_passive(State0, Nodes) ->
                 add_passive(PeerName, AccState)
               end, State0, Nodes).
 
-
 add_passive(PeerName, State0) ->
   #?MODULE{active_view=ActiveView, passive_view=PassiveView0, config=Config} = State0,
 
@@ -374,10 +369,9 @@ add_passive(PeerName, State0) ->
   AlreadyPassiveViewHas = maps:is_key(PeerName, PassiveView0),
   IsThisMe = whereis(PeerName) =:= self(),
 
-  ShouldAddPassive =
-    AlreadyActiveViewHas orelse
-    AlreadyPassiveViewHas orelse
-    IsThisMe,
+  ShouldAddPassive = AlreadyActiveViewHas orelse
+                     AlreadyPassiveViewHas orelse
+                     IsThisMe,
 
   case ShouldAddPassive of
     true ->
@@ -490,7 +484,6 @@ pick_one_randomly(PeerMap) ->
   Index = rand:uniform(Size),
   lists:nth(Index, ViewKeyList).
 
-
 schedule_shuffle(ShuffleInterval) ->
   Self = self(),
   Msg = {do_shuffle},
@@ -530,7 +523,7 @@ shuffle_reply_message(Nodes) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%           Neighbor Event            %%%%%%%%%%
+%%%%%%%%%%%%%       Neighbor Event         %%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 neighbor_event(up, PeerName) ->
