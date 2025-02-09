@@ -23,7 +23,4 @@ disconnect(Endpoint) ->
   ok.
 
 notify(PeerEvent) ->
-  % TODO
-  % 1. Create ETS Table
-  % 2. Put event to ETS Table.
-  ok.
+  gen_server:cast(self(), PeerEvent).

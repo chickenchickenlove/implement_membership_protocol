@@ -1,11 +1,13 @@
 -module(plum_tree_protocol).
 
+-behavior(gossip_protocol).
+
 %% API
 -export([broadcast/2]).
--export([handle_msg/2]).
--export([schedule_dispatch/0]).
+-export([handle_message/2]).
+-export([schedule_loop_if_needed/0]).
+-export([new_state/1]).
 -compile(no_warn_unused_variables).
-
 
 %%%
 % Lazy push : Send `IHave` Message to lazy peers.
@@ -14,8 +16,6 @@
 % - 자신이 알고 있는 것을 바로 Gossiping 한다.
 % - Graft Message
 %   - 나는 그 메세지가 없으니, 나에게 그 메세지 전문을 보내줘.
-
-
 
 
 % 15 seconds
@@ -33,7 +33,6 @@
 -define(IGNORE_ROUND, -1).
 
 -type peer_name() :: atom().
--type uuid() :: uuid:uuid().
 -type message_id() :: uuid:uuid().
 
 -record(lazy_record, {
@@ -76,19 +75,22 @@
 % Timers: “타이머가 걸린 메시지 ID들”을 추적.
 
 broadcast(NodeName, Data) ->
-  Data = {broadcast, Data},
+  Msg = {broadcast, Data},
   ToPid = find_util:get_node_pid(NodeName),
-  gen_server:cast(ToPid, Data).
+  gen_server:cast(ToPid, Msg).
+
+new_state(Reactor) ->
+  #?MODULE{reactor=Reactor}.
 
 
 % From HyParView or other membership protocol.
-handle_msg({neighbor_up, PeerName}=_Msg, State0) ->
+handle_message({neighbor_up, PeerName}=_Msg, State0) ->
   #?MODULE{eager_push_peers=EagerPushPeers0} = State0,
   EagerPushPeers = sets:add_element(PeerName, EagerPushPeers0),
   State0#?MODULE{eager_push_peers=EagerPushPeers};
 
 % From HyParView or other membership protocol.
-handle_msg({neighbor_down, PeerName}=_Msg, State0) ->
+handle_message({neighbor_down, PeerName}=_Msg, State0) ->
   #?MODULE{eager_push_peers=EagerPushPeers0, lazy_push_peers=LazyPushPeers0, missing=Missing0} = State0,
 
   EagerPushPeers = sets:del_element(PeerName, EagerPushPeers0),
@@ -102,7 +104,8 @@ handle_msg({neighbor_down, PeerName}=_Msg, State0) ->
   State0#?MODULE{eager_push_peers=EagerPushPeers, lazy_push_peers=LazyPushPeers, missing=Missing};
 
 % For Client
-handle_msg({broadcast, Data}=_Msg, State0) ->
+handle_message({broadcast, Data}=_Msg, State0) ->
+  io:format("[~p] ~p received brodcast message, ~p~n", [self(), my_name(), Data]),
   #?MODULE{received_messages=ReceivedMessages0} = State0,
 
   MsgId = uuid:get_v4(),
@@ -117,7 +120,9 @@ handle_msg({broadcast, Data}=_Msg, State0) ->
   schedule_received_message_expire(Gossip),
   State2#?MODULE{received_messages=ReceivedMessages};
 
-handle_msg({gossip, Gossip, PeerName}, State0) ->
+handle_message({gossip, Gossip, Sender}, State0) ->
+  io:format("[~p] ~p received gossip message, peername ~p.~n", [self(), my_name(), Sender]),
+
   #?MODULE{received_messages=ReceivedMessages0} = State0,
   MessageId = get_from_gossip(message_id, Gossip),
   UpdatedState =
@@ -126,28 +131,30 @@ handle_msg({gossip, Gossip, PeerName}, State0) ->
         ReceivedMessages = maps:put(MessageId, Gossip, ReceivedMessages0),
         NextRoundGossip = increment_round_gossip(Gossip),
 
-        State1 = eager_push(NextRoundGossip, PeerName, State0),
-        State2 = lazy_push(NextRoundGossip, PeerName, State1),
+        State1 = eager_push(NextRoundGossip, Sender, State0),
+        State2 = lazy_push(NextRoundGossip, Sender, State1),
 
-        State3 = add_eager_and_del_lazy(PeerName, State2),
+        State3 = add_eager_and_del_lazy(Sender, State2),
         schedule_received_message_expire(Gossip),
         State3#?MODULE{received_messages=ReceivedMessages};
       _Message ->
         % It means that we have other eager edge.
         % So, We should remove this edge.
         MyName = my_name(),
-        ToPid = find_util:get_node_pid(PeerName),
+        ToPid = find_util:get_node_pid(Sender),
+        io:format("[~p] ~p try to send prune message to ~p~n", [self(), my_name(), Sender]),
         PruneMsg = prune_message(MyName),
         send_message(ToPid, PruneMsg),
 
-        add_lazy_and_del_eager(PeerName, State0)
+        add_lazy_and_del_eager(Sender, State0)
   end,
   invalidate_missing_with_given(Gossip, UpdatedState);
 
-handle_msg({prune, PeerName}, State0) ->
+handle_message({prune, PeerName}, State0) ->
+  io:format("[~p] ~p received prune message from ~p~n", [self(), my_name(), PeerName]),
   add_lazy_and_del_eager(PeerName, State0);
 
-handle_msg({dispatch}, #?MODULE{lazy_queue=LazyQueue}=State) ->
+handle_message({dispatch}, #?MODULE{lazy_queue=LazyQueue}=State) ->
   LazyRecords =
     lists:foldl(
       fun(LazyRecord, Acc0) ->
@@ -167,7 +174,7 @@ handle_msg({dispatch}, #?MODULE{lazy_queue=LazyQueue}=State) ->
 
   State;
 
-handle_msg({dispatch_short}, #?MODULE{lazy_queue=LazyQueue}=State) ->
+handle_message({dispatch_short}, #?MODULE{lazy_queue=LazyQueue}=State) ->
   BloomFiltersForEachLazyPeers =
     lists:foldl(
       fun(LazyRecord, Acc) ->
@@ -188,7 +195,7 @@ handle_msg({dispatch_short}, #?MODULE{lazy_queue=LazyQueue}=State) ->
   State;
 
 % For tree repair.
-handle_msg({ihave, Grafts, Sender}, State0) ->
+handle_message({ihave, Grafts, Sender}, State0) ->
   % We should wait a while before asking graft message.
   % Because lazy push may arrive before eager push.
   State1 = lists:foldl(
@@ -211,7 +218,7 @@ handle_msg({ihave, Grafts, Sender}, State0) ->
 
   State1;
 
-handle_msg({ihave_bloom, BloomFilter, Sender}, State0) ->
+handle_message({ihave_bloom, BloomFilter, Sender}, State0) ->
   #?MODULE{missing=Missing0, timers=Timers0, cached_graft_msg=CachedGraftMsg0} = State0,
 
   MissingMsgs = lists:foldl(
@@ -231,7 +238,7 @@ handle_msg({ihave_bloom, BloomFilter, Sender}, State0) ->
         true ->
           MsgAndSender = {MessageId, Sender},
           case sets:is_element(MsgAndSender, CachedGraftMsgAcc) of
-            true -> {TimersAcc, CachedGraftMsg, ReservedMsgAndSenderAcc};
+            true -> {TimersAcc, CachedGraftMsgAcc, ReservedMsgAndSenderAcc};
             false ->
               CachedGraftMsgAcc1 = sets:add_element(MsgAndSender, CachedGraftMsgAcc),
               TimersAcc1 = sets:add_element(MessageId, TimersAcc),
@@ -240,16 +247,16 @@ handle_msg({ihave_bloom, BloomFilter, Sender}, State0) ->
               schedule_wait_a_while_with_bloom_filter(MessageId, Sender),
               {TimersAcc1, CachedGraftMsgAcc1, ReservedMsgAndSenderAcc1}
           end;
-        false -> {TimersAcc, CachedGraftMsg, ReservedMsgAndSenderAcc}
+        false -> {TimersAcc, CachedGraftMsgAcc, ReservedMsgAndSenderAcc}
       end
-    end, {Timers0, CachedGraftMsg, []}, NotReservedMsgYet),
+    end, {Timers0, CachedGraftMsg0, []}, NotReservedMsgYet),
 
   schedule_cached_graft_message_expire(ReservedMsgAndSender),
 
-  State0#?MODULE{timers=Timers};
+  State0#?MODULE{timers=Timers, cached_graft_msg=CachedGraftMsg};
 
 % For tree repair.
-handle_msg({wait_message_arrived, MessageId}, State0) ->
+handle_message({wait_message_arrived, MessageId}, State0) ->
   #?MODULE{missing=Missing0, timers=Timers0, received_messages=ReceivedMessage} = State0,
   Timers = sets:del_element(MessageId, Timers0),
 
@@ -269,13 +276,13 @@ handle_msg({wait_message_arrived, MessageId}, State0) ->
             MyName = my_name(),
             GraftMsg = graft_message(MessageId, Round, MyName),
             send_message(SenderPid, GraftMsg),
-            State1
+            State1#?MODULE{missing=Missing}
         end
     end,
 
-  State#?MODULE{missing=Missing, timers=Timers};
+  State#?MODULE{timers=Timers};
 
-handle_msg({wait_message_arrived_with_bloom, MessageId, Sender}, State0) ->
+handle_message({wait_message_arrived_with_bloom, MessageId, Sender}, State0) ->
   #?MODULE{timers=Timers0, received_messages=ReceivedMessage} = State0,
   Timers = sets:del_element(MessageId, Timers0),
 
@@ -295,7 +302,7 @@ handle_msg({wait_message_arrived_with_bloom, MessageId, Sender}, State0) ->
 
 
 % For tree repair.
-handle_msg({graft, MessageId, _Round, PeerName}, State0) ->
+handle_message({graft, MessageId, _Round, PeerName}, State0) ->
   State1 = add_eager_and_del_lazy(PeerName, State0),
   #?MODULE{received_messages=ReceivedMessages} = State1,
 
@@ -314,17 +321,17 @@ handle_msg({graft, MessageId, _Round, PeerName}, State0) ->
 
   State1;
 
-handle_msg({lazy_push_expired, ExpiredLazyRecord}, State0) ->
+handle_message({lazy_push_expired, ExpiredLazyRecord}, State0) ->
   #?MODULE{lazy_queue=LazyQueue0} = State0,
   LazyQueue = lists: delete(ExpiredLazyRecord, LazyQueue0),
   State0#?MODULE{lazy_queue=LazyQueue};
 
-handle_msg({received_message_expired, MessageId}, State0) ->
+handle_message({received_message_expired, MessageId}, State0) ->
   #?MODULE{received_messages=ReceivedMessages0} = State0,
   ReceivedMessages = maps:remove(MessageId, ReceivedMessages0),
   State0#?MODULE{received_messages=ReceivedMessages};
 
-handle_msg({cached_graft_message_expire, ReservedMsgAndSenderList}, State0) ->
+handle_message({cached_graft_message_expire, ReservedMsgAndSenderList}, State0) ->
   #?MODULE{cached_graft_msg=CachedGraftMessages0} = State0,
 
   CachedGraftMessage = lists:foldl(
@@ -333,10 +340,14 @@ handle_msg({cached_graft_message_expire, ReservedMsgAndSenderList}, State0) ->
     end, CachedGraftMessages0, ReservedMsgAndSenderList),
   State0#?MODULE{cached_graft_msg=CachedGraftMessage};
 
-handle_msg(_Msg, State) ->
+handle_message(_Msg, State) ->
   State.
 
 % Schedule function
+schedule_loop_if_needed() ->
+  schedule_dispatch(),
+  schedule_short_dispatch().
+
 schedule_lazy_push_expired(LazyRecord) ->
   LazyPushExpiredMsg = {lazy_push_expired, LazyRecord},
   send_message_after(?LAZY_PUSH_TTL, self(), LazyPushExpiredMsg).
@@ -470,7 +481,8 @@ eager_push(Gossip, PeerName, State) ->
   lists:foreach(
     fun(ToPeerName) ->
       ToPeerPid = find_util:get_node_pid(ToPeerName),
-      GossipMsg = gossip_message(Gossip, ToPeerName),
+      GossipMsg = gossip_message(Gossip, my_name()),
+      io:format("[~p] ~p try to send a gossip to ~p~n", [self(), my_name(), ToPeerName]),
       send_message(ToPeerPid, GossipMsg)
     end, sets:to_list(FilteredEagerPushPeer)
   ),
@@ -495,11 +507,11 @@ lazy_push(Gossip, PeerName, State0) ->
 invalidate_missing_with_given(Gossip, State0) ->
   #?MODULE{missing=Missing0} = State0,
   #gossip{message_id=MessageId} = Gossip,
-  Missing = lists:filter(
+  Missing = sets:filter(
     fun(Announcement) ->
       AnnounceMsgId = maps:get(message_id, Announcement),
       not AnnounceMsgId =:= MessageId
-    end, sets:to_list(Missing0)),
+    end, Missing0),
   State0#?MODULE{missing=Missing}.
 
 
@@ -511,7 +523,7 @@ my_name() ->
 new_gossip(MessageId, Data) ->
   #gossip{message_id=MessageId, round=0, data=Data}.
 
-increment_round_gossip(#gossip{round=Round} = Gossip0) ->
+increment_round_gossip(#gossip{round=Round}=Gossip0) ->
   Gossip0#gossip{round=Round+1}.
 
 get_from_gossip(message_id, Gossip) ->
