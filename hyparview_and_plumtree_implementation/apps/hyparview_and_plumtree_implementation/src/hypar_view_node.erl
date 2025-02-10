@@ -87,6 +87,7 @@ init([NodeName, Config, GossipProtocolModule, ReactorModule]) ->
   schedule_shuffle(ShuffleInterval),
 
   GossipProtocolState = GossipProtocolModule:new_state(ReactorModule),
+  GossipProtocolModule:schedule_loop_if_needed(),
 
   State = #?MODULE{
     name=NodeName, pid=SelfPid, config=Config,
